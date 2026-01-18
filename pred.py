@@ -8,12 +8,17 @@ from openai import OpenAI
 from transformers import AutoTokenizer
 import tiktoken
 import torch.multiprocessing as mp
+from compression.main_compressor import MainCompressor
 
 model_map = json.loads(open('config/model2path.json', encoding='utf-8').read())
 maxlen_map = json.loads(open('config/model2maxlen.json', encoding='utf-8').read())
+import base64
+
+ENABLE_COMPRESSION = False
+IMAGE_MODEL = "gpt-4o-mini"
 
 URL = "http://127.0.0.1:8000/v1"
-API_KEY = "token-abc123"
+API_KEY = os.getenv("OPENAI_API_KEY")
 template_rag = open('prompts/0shot_rag.txt', encoding='utf-8').read()
 template_no_context = open('prompts/0shot_no_context.txt', encoding='utf-8').read()
 template_0shot = open('prompts/0shot.txt', encoding='utf-8').read()
@@ -55,6 +60,54 @@ def query_llm(prompt, model, tokenizer, client=None, temperature=0.5, max_new_to
         print("Max tries. Failed.")
         return ''
 
+def query_llm_image(image_bytes, model, client=None, temperature=0.5, max_new_tokens=128):
+    if model in model_map:
+        model = model_map[model]
+    image_b64 = base64.b64encode(image_bytes).decode("ascii")
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "image_url",
+                    "image_url": {"url": f"data:image/png;base64,{image_b64}"},
+                }
+            ],
+        }
+    ]
+    tries = 0
+    while tries < 5:
+        tries += 1
+        try:
+            completion = client.chat.completions.create(
+                model=model,
+                messages=messages,
+                temperature=temperature,
+                max_tokens=max_new_tokens,
+            )
+            return completion.choices[0].message.content
+        except KeyboardInterrupt as e:
+            raise e
+        except Exception as e:
+            print("Error Occurs: \"%s\"        Retry ..."%(str(e)))
+            time.sleep(1)
+    else:
+        print("Max tries. Failed.")
+        return ''
+
+def log_compression_artifacts(log_dir, item_id, stage, original_text, compressed_text, image_bytes):
+    if not log_dir:
+        return
+    safe_id = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(item_id))
+    base = f"{safe_id}_{stage}"
+    os.makedirs(log_dir, exist_ok=True)
+    with open(os.path.join(log_dir, f"{base}_original.txt"), "w", encoding="utf-8") as f:
+        f.write(original_text)
+    with open(os.path.join(log_dir, f"{base}_compressed.txt"), "w", encoding="utf-8") as f:
+        f.write(compressed_text)
+    with open(os.path.join(log_dir, f"{base}_image.png"), "wb") as f:
+        f.write(image_bytes)
+
 def extract_answer(response):
     response = response.replace('*', '')
     match = re.search(r'The correct answer is \(([A-D])\)', response)
@@ -77,6 +130,7 @@ def get_pred(data, args, fout):
         base_url=URL,
         api_key=API_KEY
     )
+    compressor = MainCompressor()
     for item in tqdm(data):
         context = item['context']
         if args.rag > 0:
@@ -91,17 +145,54 @@ def get_pred(data, args, fout):
         else:
             template = template_0shot
         prompt = template.replace('$DOC$', context.strip()).replace('$Q$', item['question'].strip()).replace('$C_A$', item['choice_A'].strip()).replace('$C_B$', item['choice_B'].strip()).replace('$C_C$', item['choice_C'].strip()).replace('$C_D$', item['choice_D'].strip())
-        if args.cot:
-            output = query_llm(prompt, model, tokenizer, client, temperature=0.1, max_new_tokens=1024)
+        print(f"Prompt before compression: {prompt}")
+        compressed_prompt = prompt
+        if ENABLE_COMPRESSION:
+            compressed_prompt = compressor.compress_text(prompt)
+        print(f"Prompt after compression: {compressed_prompt}")
+        if ENABLE_COMPRESSION:
+            image_bytes = compressor.compress_text_to_image(compressed_prompt)
+            log_compression_artifacts(
+                args.compress_log_dir,
+                item["_id"],
+                "prompt",
+                prompt,
+                compressed_prompt,
+                image_bytes,
+            )
+            if args.cot:
+                output = query_llm_image(image_bytes, IMAGE_MODEL, client, temperature=0.1, max_new_tokens=1024)
+            else:
+                output = query_llm_image(image_bytes, IMAGE_MODEL, client, temperature=0.1, max_new_tokens=128)
         else:
-            output = query_llm(prompt, model, tokenizer, client, temperature=0.1, max_new_tokens=128)
+            if args.cot:
+                output = query_llm(prompt, model, tokenizer, client, temperature=0.1, max_new_tokens=1024)
+            else:
+                output = query_llm(prompt, model, tokenizer, client, temperature=0.1, max_new_tokens=128)
         if output == '':
             continue
         if args.cot: # extract answer
             response = output.strip()
             item['response_cot'] = response
             prompt = template_0shot_cot_ans.replace('$DOC$', context.strip()).replace('$Q$', item['question'].strip()).replace('$C_A$', item['choice_A'].strip()).replace('$C_B$', item['choice_B'].strip()).replace('$C_C$', item['choice_C'].strip()).replace('$C_D$', item['choice_D'].strip()).replace('$COT$', response)
-            output = query_llm(prompt, model, tokenizer, client, temperature=0.1, max_new_tokens=128)
+            print(f"Prompt for extracting answer before compression: {prompt}")
+            compressed_prompt = prompt
+            if ENABLE_COMPRESSION:
+                compressed_prompt = compressor.compress_text(prompt)
+            print(f"Prompt for extracting answer after compression: {compressed_prompt}")
+            if ENABLE_COMPRESSION:
+                image_bytes = compressor.compress_text_to_image(compressed_prompt)
+                log_compression_artifacts(
+                    args.compress_log_dir,
+                    item["_id"],
+                    "cot",
+                    prompt,
+                    compressed_prompt,
+                    image_bytes,
+                )
+                output = query_llm_image(image_bytes, IMAGE_MODEL, client, temperature=0.1, max_new_tokens=128)
+            else:
+                output = query_llm(prompt, model, tokenizer, client, temperature=0.1, max_new_tokens=128)
             if output == '':
                 continue
         response = output.strip()
@@ -114,6 +205,12 @@ def get_pred(data, args, fout):
 
 def main():
     os.makedirs(args.save_dir, exist_ok=True)
+    if ENABLE_COMPRESSION:
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        args.compress_log_dir = os.path.join(args.save_dir, f"compression_{timestamp}")
+        os.makedirs(args.compress_log_dir, exist_ok=True)
+    else:
+        args.compress_log_dir = None
     print(args)
     if args.rag > 0:
         out_file = os.path.join(args.save_dir, args.model.split("/")[-1] + f"_rag_{str(args.rag)}.jsonl")
